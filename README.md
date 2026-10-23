@@ -1,89 +1,112 @@
 # Shoplifting Detection: Video Classification
 
-Binary video classification (normal shopping behavior vs. shoplifting) with temporal deep learning models trained from scratch in PyTorch. Built for the Cellula Technologies computer vision task.
+Binary video classification of surveillance clips into **normal shopping behavior** and **shoplifting** using temporal deep learning models implemented in PyTorch. This project was developed for the Cellula Technologies computer vision task.
 
-Three architectures are implemented, each in its own notebook, on top of the same data pipeline:
+The repository explores three architectures using a shared video-processing and evaluation workflow:
 
 | Notebook | Model | Parameters |
-|---|---|---|
-| `notebooks/cnn_lstm.ipynb` | Residual CNN + BiLSTM, attention pooling, appearance shortcut | 3.27 M |
-| `notebooks/cnn_transformer.ipynb` | Residual CNN + Transformer encoder, attention pooling, residual shortcut | 3.41 M |
+|---|---|---:|
+| `notebooks/cnn_lstm.ipynb` | Residual CNN + BiLSTM with attention pooling and an appearance shortcut | 3.27 M |
+| `notebooks/cnn_transformer.ipynb` | Residual CNN + Transformer encoder | 3.41 M |
 | `notebooks/cnn3d.ipynb` | (2+1)D residual 3D CNN | 3.52 M |
 
-No pretrained weights are used anywhere.
+The LSTM notebook has been updated with duplicate/near-duplicate analysis and group-aware data splitting. The classifier is trained from scratch; a pretrained ResNet-50 is used only to create frame embeddings for the duplicate/group analysis.
 
 ## Dataset
 
-855 surveillance clips in two classes, loaded from a zip file (the link is set in `DATA_URL` in the first cell of each notebook).
+The notebooks use a dataset of surveillance clips organized into two classes:
 
-| | Normal | Shoplifting | Total |
-|---|---|---|---|
-| Clips | 531 | 324 | 855 |
+- **Normal:** `non shop lifters`
+- **Shoplifting:** `shop lifters`
 
-- Resolution: 704 x 576 for every clip
-- Frame rate: about 25 fps
-- Duration: 3 to 74 s, median 13 s (75 to 1850 frames)
+The dataset is downloaded from the URL configured in `DATA_URL` in the notebook, or can be attached directly as a Kaggle dataset. The original dataset scan found 855 clips (531 normal and 324 shoplifting). Dataset counts can differ after filtering or when using a different copy of the data.
 
-Class labels are inferred from the folder names (`non shop lifters` and `shop lifters`).
+Video metadata in the original scan:
+
+- Resolution: 704 × 576
+- Frame rate: approximately 25 fps
+- Duration: 3–74 seconds, with a median of approximately 13 seconds
 
 ## Pipeline
 
-All three notebooks share these steps.
+The updated CNN + LSTM notebook includes the following workflow:
 
-1. **Frame sampling.** `sample_indices(n, t)` computes a uniform skip interval `n / t` and takes one frame per segment, so the sampled frames span the whole clip for any length. It is verified on clips of 1 to 5000 frames. During training each frame is jittered inside its segment.
-2. **Frame cache.** Each video is decoded once into 32 uniformly spaced frames at 128 x 128 and kept in memory. Training then reads from the cache and never decodes video.
-3. **EDA.** Class balance, duration, frame count and resolution; motion, brightness and contrast per class; sample frames; a metadata-only baseline.
-4. **Split.** 70% train, 15% validation, 15% test, stratified by class. See "Evaluation notes" for the duplicate handling.
-5. **Augmentation.** Horizontal flip, random resized crop and color jitter. Every random parameter is drawn once per clip and applied to all frames. A code check confirms that all frames of a clip come out identical.
-6. **Dataset class.** Returns a tensor of shape `(T, C, H, W)` = `(16, 3, 112, 112)` per clip, plus the label.
-7. **Input to the models.** RGB plus a motion channel (the difference to the previous sampled frame), built inside the model.
-8. **Training.** AdamW, learning rate 1e-3 with 3 epochs of warmup and cosine decay, weighted binary cross-entropy, gradient clipping, mixed precision, and an exponential moving average (EMA) of the weights. At most 80 epochs, early stopping with patience 25. The best epoch is chosen on validation AUC and F1.
-9. **Evaluation.** Accuracy, precision, recall, F1 and AUC on the test set, with flip test-time augmentation. The decision threshold is reported at 0.5 and at the value that maximizes validation F1.
+1. **Video loading and label inference.** Video paths and class labels are inferred from folder/file names.
+2. **Frame sampling.** Clips are represented by uniformly sampled frames across the full video. Training applies temporal jitter to the sampled indices.
+3. **Frame cache and metadata.** Frames are decoded and resized once for reuse. Video duration, frame count, frame rate, resolution, motion, brightness, and contrast are explored.
+4. **Exploratory data analysis.** Class distribution, clip metadata, representative frames, and a metadata-only baseline are examined.
+5. **Duplicate and similarity analysis.** A pretrained ResNet-50 generates frame embeddings to identify visually similar clips. Duplicate and grouping thresholds are inspected before splitting.
+6. **Group-aware split.** `StratifiedGroupKFold` is used to create approximate train/validation/test splits while keeping similar clips in the same split to reduce data leakage.
+7. **Augmentation.** Training uses horizontal flips, random crops, and color/contrast adjustments. The same random spatial transformation is applied consistently across all frames in a clip.
+8. **Model input.** The dataset returns 16 RGB frames per clip, resized to 112 × 112. The model additionally constructs a motion input from differences between consecutive frames.
+9. **Training.** The CNN + BiLSTM is trained from scratch using AdamW, weighted binary cross-entropy, learning-rate warmup and cosine decay, gradient clipping, mixed precision when CUDA is available, exponential moving average (EMA), and early stopping.
+10. **Evaluation.** Accuracy, precision, recall, F1-score, and ROC-AUC are measured on the test split. Results are reported using both a 0.5 threshold and a threshold selected using validation F1. Horizontal-flip test-time augmentation is used.
 
-A short sanity cell before training checks that the model can memorize 32 clips, which catches pipeline bugs early.
+A sanity check before full training verifies that the model can overfit a small subset of clips, helping catch basic pipeline or training issues.
 
 ## Models
 
 ### CNN + LSTM
-A residual CNN (stem + three stages of two blocks, 64/128/256 channels) encodes each frame into a 256-d vector. A bidirectional LSTM reads the 16 vectors. The classifier receives three things concatenated: attention-pooled LSTM output, max-pooled LSTM output, and the mean of the frame vectors (appearance shortcut).
+
+A residual CNN encodes each frame into a feature vector. The sequence of frame features is processed by a bidirectional LSTM. Attention pooling and max pooling summarize the temporal features, while a mean-pooled appearance shortcut preserves clip-level visual information. The combined representation is passed to a binary classifier.
+
+The network takes RGB frames and a motion channel derived from frame-to-frame differences. Its convolutional classifier is initialized and trained from scratch.
 
 ### CNN + Transformer
-The same frame encoder, followed by a one-layer pre-norm Transformer encoder (4 heads, learned positional embedding) with a residual connection around it. The same three-part pooling feeds the classifier.
+
+A residual CNN extracts frame-level features, which are processed by a Transformer encoder with positional information. The temporal representation is pooled and passed to a binary classifier.
 
 ### 3D CNN
-A (2+1)D residual network: each 3D convolution is factorized into a spatial 3x3 and a temporal 3x1 convolution. A (1x5x5) stem keeps all 16 frames; time is halved in the two later stages (16 to 8 to 4). The head uses global average and max pooling.
 
-All models use Kaiming initialization and zero-initialized last BatchNorm scales in the residual blocks, which makes training from scratch stable.
+A (2+1)D residual network factorizes 3D convolutions into spatial and temporal operations to learn appearance and motion patterns jointly.
 
 ## Results
 
-Test set, threshold 0.5 / threshold tuned on validation:
+### Updated CNN + LSTM notebook
 
-| Model | Split | Test clips | Accuracy | F1 | AUC |
-|---|---|---|---|---|---|
-| CNN + LSTM | all 855 clips | 129 | 0.977 / 0.977 | 0.970 / 0.969 | 0.997 |
-| 3D CNN | all 855 clips | 129 | 0.961 / 0.969 | 0.952 / 0.961 | 0.991 |
-| CNN + Transformer | duplicates removed | 92 | 0.859 / 0.870 | 0.860 / 0.872 | 0.939 |
+The latest saved evaluation output reports the following test metrics:
 
-## Evaluation notes
+| Decision threshold | Accuracy | Precision | Recall | F1-score | ROC-AUC |
+|---|---:|---:|---:|---:|---:|
+| 0.50 | 0.8780 | 0.9348 | 0.8600 | 0.8958 | 0.9681 |
+| 0.27 (selected on validation) | 0.8902 | 0.8596 | 0.9800 | 0.9159 | 0.9681 |
 
-- **Duplicates.** 237 of the 855 clips are exact copies of other clips (nearly all in the normal class). The Transformer notebook removes them and splits by group, so near-identical scenes stay in one split. The LSTM and 3D CNN notebooks were run before this step, with copies spread across train, validation and test. Their scores are therefore optimistic, and **the three rows above are not directly comparable**. A fair comparison needs the duplicate cells from `cnn_transformer.ipynb` in every notebook.
-- **Test set size.** With 92 to 129 test clips, one clip moves accuracy by about 1 point. Differences of 2 points or less between models are within noise.
-- **Shared camera scenes.** Clips from the same camera can still appear in different splits. Only exact duplicates and close copies are grouped.
-- **Metadata shortcuts.** In the EDA, brightness alone reaches an AUC of 0.64 and a metadata-only logistic regression reaches 0.76, so part of the signal in this dataset is scene appearance and not behavior.
-- **Sparse sampling.** 16 frames cover a whole clip (about 0.8 s between frames), so fast hand movements are only coarsely visible.
+The threshold selected on the validation set increases recall and F1-score on the saved test evaluation. The 0.5 threshold gives higher precision. The reported results are from the notebook's saved outputs and may change when the notebook is rerun with different data, environment, or training conditions.
+
+### Comparison with earlier model runs
+
+The Transformer and 3D CNN results below are from earlier runs and should not be treated as a controlled comparison with the updated LSTM run. Their split and duplicate-handling procedures differed.
+
+| Model | Evaluation split | Test clips | Accuracy | F1-score | ROC-AUC |
+|---|---|---:|---:|---:|---:|
+| CNN + Transformer | Duplicate-aware split | 92 | 0.859–0.870 | 0.860–0.872 | 0.939 |
+| 3D CNN | Earlier split | 129 | 0.961–0.969 | 0.952–0.961 | 0.991 |
+
+The earlier CNN + LSTM result is intentionally not repeated here because the notebook has since been updated with a different split procedure. For a fair model comparison, all architectures should use the same duplicate-aware grouping and train/validation/test split.
+
+## Evaluation considerations
+
+- **Potential data leakage:** Similar clips can inflate test scores if related videos appear across different splits. The updated LSTM notebook uses visual similarity grouping to reduce this risk.
+- **Threshold selection:** The 0.5 threshold and the validation-selected threshold reflect different precision/recall trade-offs. The threshold must be selected using validation data, not the test set.
+- **Limited test size:** Metrics can vary noticeably when the test set contains a relatively small number of clips.
+- **Scene-related shortcuts:** Brightness, background, and other visual characteristics may correlate with labels. High scores do not necessarily mean the model has learned shoplifting behavior alone.
+- **Sparse temporal sampling:** Sampling a limited number of frames across a clip can miss brief actions or fast hand movements.
 
 ## How to run
 
-1. Open a notebook on Kaggle (or Colab) with a GPU and internet enabled.
-2. Set `DATA_URL` in the first cell to a zip link (Google Drive links work through `gdown`), or leave it empty and attach the data as a Kaggle dataset.
-3. Run all cells. Training takes roughly 10 to 25 minutes on a T4 GPU.
+1. Open the notebook in Kaggle or Google Colab with internet access and, ideally, a GPU.
+2. Set `DATA_URL` in the first code cell to a downloadable ZIP link, or set it up to use a dataset attached to the notebook.
+3. Run the notebook cells in order.
 
-Requirements: Python 3.10+, PyTorch, OpenCV, NumPy, pandas, scikit-learn, SciPy, matplotlib, joblib, tqdm, gdown. All are preinstalled on Kaggle.
+Training is configured for up to 80 epochs with early stopping. Runtime depends on the available hardware and dataset.
+
+## Requirements
+
+Python 3.10+, PyTorch, OpenCV, NumPy, pandas, scikit-learn, SciPy, matplotlib, joblib, tqdm, and `gdown`. The notebook also uses `torchvision` for the ResNet-50 embeddings in duplicate analysis. Most dependencies are available by default in Kaggle notebooks.
 
 ## Repository layout
 
-```
+```text
 .
 ├── README.md
 └── notebooks/
@@ -92,12 +115,15 @@ Requirements: Python 3.10+, PyTorch, OpenCV, NumPy, pandas, scikit-learn, SciPy,
     └── cnn3d.ipynb
 ```
 
+Update the notebook paths in this section if your repository uses different filenames or locations.
+
 ## References
 
 - J. Donahue et al. *Long-term Recurrent Convolutional Networks for Visual Recognition and Description.* CVPR 2015. arXiv:1411.4389
 - D. Tran et al. *A Closer Look at Spatiotemporal Convolutions for Action Recognition* (R(2+1)D). CVPR 2018. arXiv:1711.11248
 - K. He et al. *Deep Residual Learning for Image Recognition.* CVPR 2016.
 - A. Vaswani et al. *Attention Is All You Need.* NeurIPS 2017.
-- P. Goyal et al. *Accurate, Large Minibatch SGD: Training ImageNet in 1 Hour.* 2017. arXiv:1706.02677 (zero-initialized residual BatchNorm)
+- P. Goyal et al. *Accurate, Large Minibatch SGD: Training ImageNet in 1 Hour.* 2017. arXiv:1706.02677
 - I. Muneer, M. Saddique, Z. Habib, H. G. Mohamed. *Shoplifting Detection Using Hybrid Neural Network CNN-BiLSTM and Development of Benchmark Dataset.* Applied Sciences 13(14), 8341, 2023. doi:10.3390/app13148341
 - M. A. Ansari, D. K. Singh. *Optimized Parameter Tuning in a Recurrent Learning Process for Shoplifting Activity Classification.* Cybernetics and Information Technologies 23(1), 2023. doi:10.2478/cait-2023-0008
+
